@@ -13,13 +13,14 @@
 1. [Contexto e motivação](#1-contexto-e-motivação)
 2. [Encaixe no Módulo 5](#2-encaixe-no-módulo-5)
 3. [O Problema](#3-o-problema)
-4. [Tecnologias utilizadas](#4-tecnologias-utilizadas)
-5. [Arquitetura da solução](#5-arquitetura-da-solução)
-6. [O Contrato](#6-o-contrato)
-7. [Como executar no remix IDE](#7-como-executar-no-remix-ide)
-8. [Casos de teste](#8-casos-de-teste)
-9. [Conclusão](#9-conclusão)
-10. [Referências Bibliográficas](#10-referências-bibliográficas)
+4. [Modelagem do Contrato](#4-modelagem-do-contrato)
+5. [Tecnologias utilizadas](#5-tecnologias-utilizadas)
+6. [Arquitetura da solução](#6-arquitetura-da-solução)
+7. [O Contrato](#7-o-contrato)
+8. [Como executar no Remix IDE](#8-como-executar-no-remix-ide)
+9. [Casos de teste](#9-casos-de-teste)
+10. [Conclusão](#10-conclusão)
+11. [Referências Bibliográficas](#11-referências-bibliográficas)
 
 ---
 
@@ -81,23 +82,222 @@ Além do determinismo da lógica, três propriedades intrínsecas da blockchain 
 
 ---
 
-## 4. Tecnologias utilizadas
+## 4. Modelagem do Contrato
 
-### 4.1 Solidity
+Esta seção apresenta a modelagem do `ANACDocumentAuthentication`, percorrendo o cenário em linguagem natural, os atores e ativos envolvidos, as regras que governam o sistema, o estado que o contrato mantém, as operações que ele expõe e as considerações de segurança.
+
+---
+
+### 4.1 Descrição informal do cenário
+
+Imagine um passageiro que vai ao aeroporto para pegar um voo internacional. No balcão de check-in, o atendente precisa conferir se os documentos apresentados estão corretos para aquela viagem específica, e a resposta certa depende de vários fatores ao mesmo tempo: a pessoa é brasileira ou estrangeira? Tem menos de 18 anos? Se for menor, está viajando sozinha, com um dos pais, com os dois, ou com outra pessoa autorizada? O destino é um país que aceita RG ou exige passaporte?
+
+Hoje esse processo depende da memória e atenção do atendente, que pode errar ou aplicar as regras de forma inconsistente. A ideia do contrato `ANACDocumentAuthentication` é colocar essas regras diretamente no código, de forma que qualquer sistema — um totem de autoatendimento, um aplicativo da companhia aérea, um portal de check-in online — possa consultar o contrato e receber imediatamente a lista exata de documentos exigidos para aquele passageiro naquele voo. A resposta será sempre a mesma, não importa quem consulte ou quando: as regras da ANAC, executadas de forma automática e registradas permanentemente na blockchain.
+
+---
+
+### 4.2 Identificação dos atores
+
+Em um contrato inteligente, os "atores" são os endereços Ethereum que interagem com as funções. No `ANACDocumentAuthentication`, não há papéis diferenciados por acesso, qualquer endereço pode chamar qualquer função pública. O que varia é o propósito de quem chama.
+
+| Ator | Descrição | Tipo de interação |
+|---|---|---|
+| Sistema de check-in da companhia aérea | Principal consumidor esperado do contrato. Envia os dados do passageiro e recebe os documentos exigidos. | `verifyPassenger` (grava histórico) ou `verifyPassengerView` (somente consulta) |
+| Passageiro ou usuário final | Pode consultar o contrato diretamente por um DApp para saber o que precisará levar antes de ir ao aeroporto. | `verifyPassengerView` (sem custo de gas) |
+| Auditor ou órgão regulatório | Pode consultar o histórico de verificações associado a um endereço para fins de compliance ou auditoria. | `getVerificationCount`, `getVerificationAt` |
+| Qualquer endereço externo | O contrato não tem owner, não tem controle de acesso e não guarda saldo — qualquer endereço pode interagir livremente. | Todas as funções públicas |
+
+Vale notar que `msg.sender` — o endereço que assina a transação — é quem fica registrado no histórico de verificações. Se uma companhia aérea opera o sistema, o endereço dela ficará vinculado a cada verificação que realizar, criando uma trilha auditável por operador.
+
+---
+
+### 4.3 Identificação dos ativos
+
+Em contratos DeFi, os ativos costumam ser tokens ou Ether. No `ANACDocumentAuthentication`, o ativo central não é financeiro, eleé informacional.
+
+| Ativo | Descrição | Onde vive |
+|---|---|---|
+| Registro de verificação (`VerificationResult`) | Cada verificação realizada via `verifyPassenger` gera um registro imutável contendo o resultado, a categoria do passageiro, os documentos exigidos, o timestamp e o endereço que consultou. | `mapping verificationHistory` no storage da blockchain |
+| Contador global (`totalVerifications`) | Número acumulado de verificações realizadas em todo o contrato, visível publicamente. | Variável de estado `uint256` |
+| Lista do Mercosul estendido (`mercosulCountries`) | Array informativo com os nove países que aceitam RG como documento de viagem, disponível para front-ends e APIs. | Variável de estado `string[]` |
+| Regras da ANAC codificadas | A lógica das três categorias de passageiro, com todos os subtipos de acompanhante e distinções de destino, está embutida no próprio código do contrato e é imutável após o deploy. | Bytecode do contrato na EVM |
+
+O contrato não recebe, guarda nem transfere Ether. Não há saldo, não há pagamento, não há risco de perda financeira direta associado ao contrato em si.
+
+---
+
+### 4.4 Levantamento de regras e restrições
+
+As regras abaixo foram extraídas diretamente das normas da ANAC para voos internacionais e estão codificadas no contrato:
+
+**Regras de negócio (ANAC)**
+
+| # | Regra | Categoria |
+|---|---|---|
+| R1 | Passageiro estrangeiro sempre precisa de passaporte do país de origem | Estrangeiro |
+| R2 | Cidadão de país do Mercosul estendido pode usar RG no lugar do passaporte | Estrangeiro / Brasileiro |
+| R3 | Adulto brasileiro (>= 18 anos) precisa de passaporte; RG aceito apenas para Mercosul estendido | Adulto BR |
+| R4 | Menor com ambos os pais ou responsável legal: apenas passaporte | Menor BR |
+| R5 | Menor com um dos pais sem auth. expressa no passaporte: passaporte + autorização do outro genitor | Menor BR |
+| R6 | Menor com um dos pais e passaporte com auth. expressa: apenas o passaporte (autorização dispensada) | Menor BR |
+| R7 | Menor desacompanhado ou com adulto autorizado, sem auth. no passaporte: passaporte + autorização de ambos os responsáveis | Menor BR |
+| R8 | Autorização de ambos pode ser substituída pela Autorização Eletrônica de Viagem (CNJ) | Menor BR |
+| R9 | Menor desacompanhado ou com adulto autorizado, com passaporte com auth. expressa: autorização dispensada | Menor BR |
+| R10 | Para Mercosul estendido, menores podem usar RG no lugar do passaporte | Menor BR |
+
+**Restrições do contrato**
+
+| # | Restrição | Como é aplicada |
+|---|---|---|
+| C1 | Idade máxima aceita: 150 anos | `if (age > 150) revert InvalidAge()` na entrada das funções públicas |
+| C2 | Índice de histórico não pode exceder o tamanho do array | `if (index >= length) revert IndexOutOfBounds()` em `getVerificationAt` |
+| C3 | `_verifyBrazilianMinor` só é chamada para age <= 17 | `if (age > 17) revert InvalidAge()` como guarda interna |
+| C4 | Não há controle de acesso: qualquer endereço pode chamar qualquer função | Decisão de design — o contrato é um oráculo público de regras |
+| C5 | O contrato não aceita Ether | Nenhuma função é `payable`; envios de Ether causam revert automático |
+
+---
+
+### 4.5 Modelagem do estado
+
+O estado do contrato é o conjunto de dados que persiste na blockchain entre chamadas. No `ANACDocumentAuthentication`, o estado é composto por três elementos:
+
+**`uint256 public totalVerifications`**
+
+Contador simples que cresce a cada chamada de `verifyPassenger`. É público, então qualquer um pode consultá-lo diretamente sem chamar uma função. Serve como métrica de uso do contrato.
+
+**`mapping(address => VerificationResult[]) private verificationHistory`**
+
+O coração do estado do contrato. Para cada endereço que já chamou `verifyPassenger`, existe um array de resultados armazenado. É `private`, então só pode ser acessado pelas funções do próprio contrato — os getters `getVerificationCount` e `getVerificationAt` fazem a interface controlada com o mundo externo.
+
+**`string[] private mercosulCountries`**
+
+Array estático de nove países, populado na declaração da variável. Não é consultado pela lógica interna — serve apenas como dado de referência para front-ends.
+
+**A struct `VerificationResult`**
+
+Cada elemento do histórico é uma struct com seis campos:
+
+```
+VerificationResult
+|-- canBoard           bool             pode embarcar?
+|-- category          PassengerCategory categoria enquadrada (0, 1 ou 2)
+|-- requiredDocuments DocumentCode[]   documentos obrigatórios
+|-- optionalDocuments DocumentCode[]   documentos aceitos como alternativa
+|-- timestamp         uint256          momento do bloco (unix)
+`-- verifiedBy        address          quem fez a consulta
+```
+
+---
+
+### 4.6 Modelagem das operações
+
+**Funções de verificação (operações principais)**
+
+| Função | Visibilidade | Escreve estado? | Descrição |
+|---|---|---|---|
+| `verifyPassenger(...)` | `external` | Sim | Verifica documentos, grava resultado no histórico, emite eventos. Custa gas. |
+| `verifyPassengerView(...)` | `external view` | Não | Mesma lógica de `verifyPassenger`, sem gravar nada. Gratuito. |
+
+**Funções internas (lógica de negócio)**
+
+| Função | Visibilidade | Categoria |
+|---|---|---|
+| `_verifyBrazilianAdult(destination)` | `internal pure` | Adulto BR |
+| `_verifyBrazilianMinor(age, companionType, destination, passportAuth)` | `internal pure` | Menor BR |
+| `_verifyForeigner(destination)` | `internal pure` | Estrangeiro |
+
+Todas são `pure`: não leem nem escrevem estado, são completamente determinísticas.
+
+**Getters auxiliares (consultas)**
+
+| Função | O que retorna |
+|---|---|
+| `getVerificationCount(user)` | Número de verificações do endereço |
+| `getVerificationAt(user, index)` | Verificação específica do histórico |
+| `getMercosulCountries()` | Lista dos 9 países do Mercosul estendido |
+| `getCategoryName(category)` | Nome da categoria em português |
+| `getCompanionTypeName(cType)` | Nome do tipo de acompanhante em português |
+| `getDestinationName(dest)` | Nome do grupo de destino em português |
+| `getDocumentDescription(code)` | Descrição textual de um DocumentCode |
+
+**Eventos emitidos**
+
+| Evento | Quando é emitido | Campos indexados |
+|---|---|---|
+| `DocumentVerified` | A cada chamada de `verifyPassenger` | `requester`, `category` |
+| `MinorBoardingAlert` | Apenas quando o passageiro é menor de idade | `requester` |
+
+Os eventos são indexados para permitir filtragem eficiente por sistemas externos (como The Graph), sem precisar varrer o histórico inteiro.
+
+---
+
+### 4.7 Verificações de segurança e cenários de falha
+
+**O que acontece se alguém se comportar mal?**
+
+O principal risco em qualquer contrato é a entrada de dados maliciosos ou incorretos. No `ANACDocumentAuthentication`, isso foi tratado da seguinte forma:
+
+*Entrada de idade inválida:* Se um chamador enviar `age = 255` (máximo de `uint8`) ou qualquer valor acima de 150, a função reverte com `InvalidAge()` antes de executar qualquer lógica. Nenhum dado é gravado, nenhum gas além do consumido até o revert é cobrado.
+
+*Índice de histórico fora do intervalo:* Se alguém chamar `getVerificationAt` com um índice maior do que o tamanho do array, a função reverte com `IndexOutOfBounds()`. Isso evita o comportamento indefinido de acessar posições inexistentes em arrays Solidity.
+
+*Envio de Ether ao contrato:* Nenhuma função é `payable`. Qualquer tentativa de enviar Ether ao contrato causa revert automático pela EVM, impedindo que fundos fiquem presos.
+
+*Manipulação do histórico:* O histórico é `private` e só cresce — não existe função para deletar ou alterar registros. Um chamador mal-intencionado poderia acumular verificações no próprio endereço, mas isso apenas aumentaria seu array pessoal sem afetar outros endereços ou a lógica do contrato.
+
+*Parâmetros com valores de enum inexistentes:* Solidity reverte automaticamente se um valor numérico enviado não corresponde a nenhum membro do enum alvo. Por exemplo, enviar `companionType = 9` causa revert antes de entrar na função.
+
+**Como evitar cenários travados?**
+
+Um contrato "travado" é aquele que para de funcionar ou bloqueia fundos de forma irreversível. Os principais riscos dessa natureza foram eliminados por design:
+
+*Sem Ether, sem travamento financeiro:* Como o contrato não guarda Ether, não há risco do bug clássico de fundos bloqueados. Não há `withdraw`, não há `transfer`, não há risco de reentrância financeira.
+
+*Sem dependência de outros contratos:* O contrato não chama endereços externos. Não há risco de reentrância (Atzei, Bartoletti & Cimoli, 2017), onde um contrato malicioso poderia re-entrar na função antes de ela terminar.
+
+*Sem owner, sem risco de chave perdida:* Não existe uma variável `owner` nem funções protegidas por `onlyOwner`. Se a chave do deployer for perdida, o contrato continua funcionando normalmente — não há função administrativa que precise de autorização especial.
+
+*Sem loops sobre arrays de tamanho variável:* O contrato não itera sobre `verificationHistory` em nenhuma função pública. Isso evita o risco de uma função consumir gas demais e reverter por limite de bloco caso o histórico de um endereço cresça muito.
+
+**Limitações conhecidas**
+
+O contrato confia nos dados informados pelo chamador. Se um sistema de check-in informar que o passageiro tem 25 anos quando na verdade tem 14, o contrato retornará as regras de adulto — o que seria incorreto. A validação da veracidade dos dados de entrada é responsabilidade da camada que consome o contrato, não do contrato em si. Isso é uma limitação inerente a oráculos on-chain sem fonte de verdade externa.
+
+---
+
+### 4.8 Ir além — Extensões possíveis
+
+O contrato atual cobre as regras da ANAC para voos internacionais, mas há extensões que poderiam torná-lo ainda mais completo em um cenário de produção real:
+
+**Voos domésticos:** As regras para voos domésticos têm categorias diferentes (brasileiros a partir de 16 anos, crianças até 12 anos incompletos, adolescentes entre 12 e 15 anos). Uma versão estendida poderia receber um parâmetro `flightType` e cobrir ambos os casos.
+
+**Integração com identidade digital:** Com a evolução dos sistemas de identidade descentralizada (DIDs — Decentralized Identifiers), seria possível que o contrato recebesse uma referência verificável à identidade do passageiro em vez de dados brutos, aumentando a confiabilidade das entradas.
+
+**Controle de acesso por operador:** Para uso em produção por companhias aéreas, faria sentido adicionar um sistema de papéis (como o `AccessControl` da OpenZeppelin) que limite quem pode chamar `verifyPassenger` com gravação de histórico, reservando a função transacional apenas a operadores cadastrados.
+
+**Atualização de regras:** As normas da ANAC podem mudar. Um padrão de proxy (como o UUPS da OpenZeppelin) permitiria atualizar a lógica do contrato sem perder o histórico armazenado, resolvendo a tensão entre imutabilidade da blockchain e mutabilidade das normas regulatórias.
+
+**Emissão de certificado NFT:** Após uma verificação bem-sucedida, o contrato poderia emitir um token não-fungível (NFT) que funciona como comprovante digital de conformidade documental para aquele voo específico — algo que a companhia aérea e o passageiro poderiam guardar como evidência auditável.
+
+---
+
+## 5. Tecnologias utilizadas
+
+### 5.1 Solidity
 
 Solidity é uma linguagem de programação de alto nível, com tipagem estática, orientada a contratos e projetada especificamente para a Ethereum Virtual Machine (EVM). Sua sintaxe é influenciada por C++, Python e JavaScript. O contrato `ANACDocumentAuthentication` utiliza a versão `^0.8.20` do compilador, que introduz verificações automáticas de overflow e underflow aritméticos sem necessidade de bibliotecas externas como SafeMath, além de suporte completo a custom errors e otimizações como `unchecked`, conforme documentado pela Ethereum Foundation (2023).
 
-### 4.2 Ethereum virtual machine (EVM)
+### 5.2 Ethereum virtual machine (EVM)
 
 A EVM é o ambiente de execução sandboxed e determinístico que processa contratos inteligentes na rede Ethereum. Conforme definido por Wood (2014) no Yellow Paper, é uma máquina de Turing completa que garante que a mesma entrada sempre produzirá a mesma saída, independente do nó que a execute. Essa propriedade é central para a confiabilidade do `ANACDocumentAuthentication`: independente de quem interaja com o contrato, as regras da ANAC serão aplicadas de forma idêntica e verificável.
 
-### 4.3 Remix IDE
+### 5.3 Remix IDE
 
 O Remix IDE é um ambiente de desenvolvimento web baseado em navegador, mantido pela Ethereum Foundation, para compilação, depuração e implantação de contratos Solidity. Conforme sua documentação oficial (Remix Project, 2023), oferece compilador integrado, máquina virtual JavaScript que simula a EVM localmente sem custo real de gas, e depurador passo a passo para inspeção do estado do contrato. É a IDE indicada nos autoestudos do módulo e não requer configuração de ambiente local.
 
 ---
 
-## 5. Arquitetura da solução
+## 6. Arquitetura da solução
 
 O contrato é organizado em nove seções sequenciais:
 
@@ -173,9 +373,9 @@ Passageiro
 
 ---
 
-## 6. O Contrato
+## 7. O Contrato
 
-### 6.1 Decisões de Design e de Computação
+### 7.1 Decisões de Design e de Computação
 
 **Por que usar `DocumentCode` em vez de retornar textos?**
 
@@ -209,7 +409,7 @@ As três funções `_verifyBrazilianAdult`, `_verifyBrazilianMinor` e `_verifyFo
 
 ---
 
-### 6.2 Cuidados com Segurança
+### 7.2 Cuidados com Segurança
 
 Algumas práticas de segurança foram aplicadas no contrato:
 
@@ -220,7 +420,7 @@ Algumas práticas de segurança foram aplicadas no contrato:
 
 ---
 
-### 6.3 Parâmetros da função principal
+### 7.3 Parâmetros da função principal
 
 | Parâmetro | Tipo | Valores |
 |---|---|---|
@@ -253,7 +453,7 @@ Retornos:
 
 ---
 
-## 7. Como executar no Remix IDE
+## 8. Como executar no Remix IDE
 
 ### Passo 1 — Acessar o Remix
 
@@ -309,7 +509,7 @@ Para traduzir os códigos retornados para texto, utilize `getDocumentDescription
 
 ---
 
-## 8. Casos de teste (para testar no Remix IDE)
+## 9. Casos de teste (para testar no Remix IDE)
 
 | # | Cenário | nationality | age | companionType | destination | passportAuth | requiredDocuments esperados |
 |---|---|---|---|---|---|---|---|
@@ -329,7 +529,7 @@ Para traduzir os códigos retornados para texto, utilize `getDocumentDescription
 
 ---
 
-## 9. Conclusão
+## 10. Conclusão
 
 O desenvolvimento do contrato `ANACDocumentAuthentication` demonstra como normas regulatórias de estrutura condicional determinística podem ser traduzidas em código executável e imutável armazenado em uma blockchain. A lógica normativa da ANAC para voos internacionais, com suas três categorias de passageiros, subtipos de acompanhante para menores, distinção entre destinos do Mercosul estendido e demais países, e regra de dispensa de autorização por passaporte com autorização expressa — é integralmente coberta pelo contrato, sem margens de ambiguidade.
 
@@ -339,7 +539,7 @@ Do ponto de vista conceitual, a atividade evidencia que a blockchain é uma esco
 
 ---
 
-## 10. Referências Bibliográficas
+## 11. Referências Bibliográficas
 
 ATZEI, Nicola; BARTOLETTI, Massimo; CIMOLI, Tiziana. A Survey of Attacks on Ethereum Smart Contracts (SoK). In: **International Conference on Principles of Security and Trust (POST)**. Berlim: Springer, 2017. p. 164–186.
 
